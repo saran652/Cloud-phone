@@ -1,3 +1,4 @@
+
 from flask import Flask, jsonify, request, send_from_directory
 from pathlib import Path
 from urllib.parse import urlparse
@@ -7,11 +8,18 @@ import os
 import uuid
 import ipaddress
 import socket
+import hmac
 
 app = Flask(__name__)
 
 STORAGE = Path(os.environ.get("STORAGE_DIR", "/tmp/cloud_downloads"))
 STORAGE.mkdir(parents=True, exist_ok=True)
+
+MAX_DOWNLOAD = 100 * 1024 * 1024
+MAX_UPLOAD = 10 * 1024 * 1024
+
+# Limit incoming upload requests
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD + 1024 * 1024
 
 ANDROID_VERSIONS = [
     {"version": "Android 11", "api_level": 30},
@@ -30,6 +38,7 @@ def home():
         "android_versions_api": "/api/android/versions",
         "android_status_api": "/api/android/status",
         "download_api": "/download",
+        "upload_api": "/upload",
         "files_api": "/files"
     })
 
@@ -78,14 +87,72 @@ def is_public_host(hostname):
         return False
 
 
+def get_upload_token():
+    return os.environ.get("UPLOAD_TOKEN", "")
+
+
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    expected_token = get_upload_token()
+    supplied_token = request.headers.get("X-Upload-Token", "")
+
+    if not expected_token:
+        return jsonify({
+            "error": "Upload is not configured on the server"
+        }), 503
+
+    if not hmac.compare_digest(supplied_token, expected_token):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    uploaded = request.files.get("file")
+
+    if uploaded is None or not uploaded.filename:
+        return jsonify({
+            "error": "Missing file field"
+        }), 400
+
+    filename = secure_filename(uploaded.filename)
+
+    if not filename:
+        return jsonify({"error": "Invalid filename"}), 400
+
+    filename = str(uuid.uuid4()) + "_" + filename
+    target = STORAGE / filename
+
+    try:
+        uploaded.save(target)
+
+        return jsonify({
+            "status": "saved",
+            "filename": filename,
+            "bytes": target.stat().st_size,
+            "download_path": "/files/" + filename
+        }), 201
+
+    except OSError:
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        return jsonify({"error": "Could not save file"}), 500
+
+
 @app.route("/download", methods=["POST"])
 def download_file():
     data = request.get_json(silent=True) or {}
-    url = data.get("url", "").strip()
+    url = data.get("url", "")
+
+    if not isinstance(url, str):
+        return jsonify({"error": "URL must be text"}), 400
+
+    url = url.strip()
     parsed = urlparse(url)
 
     if parsed.scheme != "https" or not parsed.hostname:
-        return jsonify({"error": "A valid HTTPS direct-file URL is required"}), 400
+        return jsonify({
+            "error": "A valid HTTPS direct-file URL is required"
+        }), 400
 
     if parsed.username or parsed.password:
         return jsonify({"error": "URL credentials are not allowed"}), 400
@@ -96,7 +163,10 @@ def download_file():
     target = None
 
     try:
-        req = Request(url, headers={"User-Agent": "SkyDroid/1.0"})
+        req = Request(
+            url,
+            headers={"User-Agent": "SkyDroid/1.0"}
+        )
 
         with urlopen(req, timeout=30) as response:
             final_url = urlparse(response.geturl())
@@ -106,9 +176,12 @@ def download_file():
                 or not final_url.hostname
                 or not is_public_host(final_url.hostname)
             ):
-                return jsonify({"error": "Redirect destination is not allowed"}), 400
+                return jsonify({
+                    "error": "Redirect destination is not allowed"
+                }), 400
 
             content_type = response.headers.get("Content-Type", "")
+
             if "text/html" in content_type.lower():
                 return jsonify({
                     "error": "This URL opens a webpage, not a direct file"
@@ -125,12 +198,13 @@ def download_file():
             with open(target, "wb") as out:
                 while True:
                     chunk = response.read(65536)
+
                     if not chunk:
                         break
 
                     size += len(chunk)
 
-                    if size > 100 * 1024 * 1024:
+                    if size > MAX_DOWNLOAD:
                         out.close()
                         target.unlink(missing_ok=True)
                         return jsonify({
@@ -193,6 +267,14 @@ def not_found(error):
         "error": "Not Found",
         "message": "Check the URL path or server routes"
     }), 404
+
+
+@app.errorhandler(413)
+def file_too_large(error):
+    return jsonify({
+        "error": "Request too large",
+        "message": "Upload limit is 10 MB"
+    }), 413
 
 
 @app.errorhandler(500)
